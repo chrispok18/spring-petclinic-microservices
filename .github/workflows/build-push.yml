@@ -1,0 +1,214 @@
+# PETPLAT-49: build ARM64 images for changed services, Trivy-scan them, push to ECR (petclinic-dev).
+# Spec: petclinic-platform docs/technical-spec.md, "CI/CD Pipeline" and "Docker Build".
+#
+# Flow: changes (pick services) -> jars (one Maven build on x86) -> image (matrix, buildx linux/arm64,
+# Trivy gate, push). The repository_dispatch to the platform repo is intentionally omitted;
+# image tags in helm-values/ are updated manually for now.
+
+name: Build & Push
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC token for aws-actions/configure-aws-credentials
+  contents: read
+
+concurrency:
+  group: build-push-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      modules: ${{ steps.matrix.outputs.modules }}
+      any: ${{ steps.matrix.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Filter changed paths
+        id: filter
+        if: github.event_name == 'push'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            config-server:
+              - 'spring-petclinic-config-server/**'
+            discovery-server:
+              - 'spring-petclinic-discovery-server/**'
+            api-gateway:
+              - 'spring-petclinic-api-gateway/**'
+            customers-service:
+              - 'spring-petclinic-customers-service/**'
+            visits-service:
+              - 'spring-petclinic-visits-service/**'
+            vets-service:
+              - 'spring-petclinic-vets-service/**'
+            genai-service:
+              - 'spring-petclinic-genai-service/**'
+            admin-server:
+              - 'spring-petclinic-admin-server/**'
+            # Inputs shared by every image: a change here rebuilds all 8.
+            shared:
+              - 'pom.xml'
+              - 'docker/Dockerfile'
+              - '.github/workflows/build-push.yml'
+
+      - name: Build service matrix
+        id: matrix
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          CHANGES: ${{ steps.filter.outputs.changes }}
+        run: |
+          # The OIDC trust policy only accepts refs/heads/main; fail early with a clear message.
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::build-push must run on main (OIDC role trusts refs/heads/main only); got $REF"
+            exit 1
+          fi
+
+          # Ports from the spec's Service Inventory (pom.xml docker.image.exposed.port is wrong for several).
+          all='[
+            {"service":"config-server",     "port":8888},
+            {"service":"discovery-server",  "port":8761},
+            {"service":"api-gateway",       "port":8080},
+            {"service":"customers-service", "port":8081},
+            {"service":"visits-service",    "port":8082},
+            {"service":"vets-service",      "port":8083},
+            {"service":"genai-service",     "port":8084},
+            {"service":"admin-server",      "port":9090}
+          ]'
+
+          if [ "$EVENT" = "workflow_dispatch" ] || echo "${CHANGES:-[]}" | jq -e 'index("shared")' >/dev/null; then
+            selected=$(echo "$all" | jq -c '.')
+          else
+            selected=$(echo "$all" | jq -c --argjson changed "${CHANGES:-[]}" '[.[] | select(.service as $s | $changed | index($s))]')
+          fi
+
+          echo "matrix={\"include\":$selected}" >> "$GITHUB_OUTPUT"
+          echo "modules=$(echo "$selected" | jq -r '[.[] | "spring-petclinic-" + .service] | join(",")')" >> "$GITHUB_OUTPUT"
+          echo "any=$(echo "$selected" | jq 'length > 0')" >> "$GITHUB_OUTPUT"
+          echo "Selected services: $(echo "$selected" | jq -r '[.[].service] | join(" ")')"
+
+  jars:
+    name: Maven build (JARs)
+    needs: changes
+    if: needs.changes.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # Tests are skipped here; maven-build.yml runs them on the same push.
+      - name: Package selected modules
+        env:
+          MODULES: ${{ needs.changes.outputs.modules }}
+        run: ./mvnw -B -ntp package -DskipTests -pl "$MODULES" -am
+
+      - name: Read project version
+        id: version
+        run: echo "version=$(./mvnw -q -ntp help:evaluate -Dexpression=project.version -DforceStdout)" >> "$GITHUB_OUTPUT"
+
+      # Boot jars only (*.jar.original is excluded by the glob).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jars
+          path: spring-petclinic-*/target/*.jar
+          if-no-files-found: error
+          retention-days: 1
+
+  image:
+    name: Image ${{ matrix.service }}
+    needs: [changes, jars]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    env:
+      MODULE: spring-petclinic-${{ matrix.service }}
+      ARTIFACT_NAME: spring-petclinic-${{ matrix.service }}-${{ needs.jars.outputs.version }}
+      ECR_REPOSITORY: petclinic-dev/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: jars
+          path: .
+
+      - name: Compute image tag
+        id: tag
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image (linux/arm64, load locally for scan)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.MODULE }}/target
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          build-args: |
+            ARTIFACT_NAME=${{ env.ARTIFACT_NAME }}
+            EXPOSED_PORT=${{ matrix.port }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.sha }}
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+
+      - name: Trivy scan (fail on fixable CRITICAL)
+        # Pinned to the v0.36.0 commit; tags on this action were tampered with in 2026.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+      # Same inputs as the scanned build, so every layer comes from the builder cache.
+      - name: Push image to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.MODULE }}/target
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          build-args: |
+            ARTIFACT_NAME=${{ env.ARTIFACT_NAME }}
+            EXPOSED_PORT=${{ matrix.port }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.sha }}
+          push: true
+          provenance: false
+          sbom: false
+
+      - name: Summary
+        run: |
+          echo "### ${{ matrix.service }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.sha }}\` (linux/arm64, port ${{ matrix.port }})" >> "$GITHUB_STEP_SUMMARY"
